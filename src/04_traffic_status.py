@@ -1,29 +1,44 @@
+import os
+import tempfile
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+
 import pandas as pd
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 from pathlib import Path
 
 events_path = Path("data/outputs/events.csv")
+output_path = Path("data/outputs/traffic_stats.csv")
+output_path.parent.mkdir(parents=True, exist_ok=True)
 if not events_path.exists():
     print("缺少 data/outputs/events.csv，请先运行计数脚本。")
+    pd.DataFrame(columns=["time_window_s", "vehicle_count", "status"]).to_csv(output_path, index=False)
     raise SystemExit(0)
 
 # 读取事件日志
 df = pd.read_csv(events_path)
 
-# 转换时间戳（兼容秒数或时间字符串）
-if pd.api.types.is_numeric_dtype(df["timestamp"]):
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-else:
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-df = df.dropna(subset=["timestamp"])
-if df.empty:
+time_s = None
+if "time_s" in df.columns and pd.api.types.is_numeric_dtype(df["time_s"]):
+    time_s = df["time_s"].astype(float)
+elif "timestamp" in df.columns and pd.api.types.is_numeric_dtype(df["timestamp"]):
+    time_s = df["timestamp"].astype(float)
+elif "timestamp" in df.columns:
+    parsed = pd.to_datetime(df["timestamp"], errors="coerce")
+    parsed = parsed.dropna()
+    if not parsed.empty:
+        time_s = (parsed - parsed.min()).dt.total_seconds()
+
+if time_s is None or time_s.empty:
     print("events.csv 中没有可用时间数据，已跳过交通状态统计。")
+    pd.DataFrame(columns=["time_window_s", "vehicle_count", "status"]).to_csv(output_path, index=False)
     raise SystemExit(0)
 
-# 按1分钟窗口统计车流量
-df['time_window'] = df['timestamp'].dt.floor('1min')  # 1分钟粒度
-traffic_stats = df.groupby('time_window').size().reset_index(name='vehicle_count')
+df = df.loc[time_s.index].copy()
+df["time_s"] = time_s
+df["time_window_s"] = (df["time_s"] // 60).astype(int) * 60
+traffic_stats = df.groupby("time_window_s").size().reset_index(name="vehicle_count")
 
 # 定义热度阈值（根据实际数据调整）
 LOW_THRESHOLD = 5    # 低于5辆/分钟为畅通
@@ -40,7 +55,7 @@ def get_status(count):
 traffic_stats['status'] = traffic_stats['vehicle_count'].apply(get_status)
 
 # 保存统计结果
-traffic_stats.to_csv('data/outputs/traffic_stats.csv', index=False)
+traffic_stats.to_csv(output_path, index=False)
 
 print("交通热度统计：")
 print(traffic_stats)

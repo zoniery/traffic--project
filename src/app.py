@@ -3,17 +3,152 @@ import tempfile
 
 os.environ.setdefault("STREAMLIT_HOME", os.path.join(tempfile.gettempdir(), "streamlit"))
 os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
 
 import cv2
 import streamlit as st
 from ultralytics import YOLO
+import supervision as sv
 import pandas as pd
 import matplotlib.pyplot as plt
+import warnings
+from matplotlib import font_manager
 
 OUTPUT_DIR = "data/outputs"
 EVENTS_PATH = os.path.join(OUTPUT_DIR, "events.csv")
 VIDEO_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "processed_video.mp4")
 CHART_PATH = os.path.join(OUTPUT_DIR, "traffic_trend.png")
+
+MODEL_CANDIDATES = [
+    ("yolov8n.pt", "轻量快速"),
+    ("yolov8s.pt", "均衡"),
+    ("yolov8m.pt", "精确"),
+]
+
+def configure_matplotlib():
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Glyph .* missing from font\\(s\\).*",
+        category=UserWarning,
+        module=r"matplotlib.*",
+    )
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    preferred = [
+        "PingFang SC",
+        "Heiti SC",
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Source Han Sans SC",
+        "WenQuanYi Zen Hei",
+        "Arial Unicode MS",
+        "DejaVu Sans",
+    ]
+    fonts = [f for f in preferred if f in available]
+    if fonts:
+        plt.rcParams["font.sans-serif"] = fonts
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+configure_matplotlib()
+
+
+def find_local_model(model_name: str) -> str | None:
+    candidates = [
+        os.path.join(os.getcwd(), model_name),
+        os.path.join(os.path.dirname(__file__), model_name),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def recommend_counting_line(video_path: str, model_path: str, max_frames: int = 200):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if fps <= 0 or width <= 0 or height <= 0:
+        cap.release()
+        return None
+
+    model = YOLO(model_path)
+    tracker = sv.ByteTrack()
+    bounds = {}
+
+    for _ in range(max_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        res = model(frame, classes=[2, 3, 5, 7], verbose=False)
+        detections = sv.Detections.from_ultralytics(res[0])
+        detections = tracker.update_with_detections(detections)
+        if detections.tracker_id is None or detections.xyxy is None or len(detections) == 0:
+            continue
+        ids = detections.tracker_id.tolist()
+        xyxy = detections.xyxy.tolist()
+        for track_id, b in zip(ids, xyxy):
+            cx = (b[0] + b[2]) / 2
+            cy = (b[1] + b[3]) / 2
+            item = bounds.get(track_id)
+            if item is None:
+                bounds[track_id] = [cx, cx, cy, cy]
+            else:
+                item[0] = min(item[0], cx)
+                item[1] = max(item[1], cx)
+                item[2] = min(item[2], cy)
+                item[3] = max(item[3], cy)
+
+    cap.release()
+    if not bounds:
+        return None
+
+    def best_overlap(orientation: str):
+        dim = height if orientation == "horizontal" else width
+        margin = max(5, dim // 100)
+        points = []
+        for min_x, max_x, min_y, max_y in bounds.values():
+            lo = (min_y + margin) if orientation == "horizontal" else (min_x + margin)
+            hi = (max_y - margin) if orientation == "horizontal" else (max_x - margin)
+            if lo < hi:
+                points.append((lo, 1))
+                points.append((hi, -1))
+        if not points:
+            return (0, dim // 2)
+        points.sort(key=lambda x: x[0])
+        best_score = 0
+        best_pos = dim // 2
+        score = 0
+        idx = 0
+        while idx < len(points):
+            pos = points[idx][0]
+            while idx < len(points) and points[idx][0] == pos:
+                score += points[idx][1]
+                idx += 1
+            if idx < len(points):
+                next_pos = points[idx][0]
+                if pos < next_pos and score > best_score:
+                    best_score = score
+                    best_pos = (pos + next_pos) / 2
+        return (best_score, best_pos)
+
+    score_h, pos_h = best_overlap("horizontal")
+    score_v, pos_v = best_overlap("vertical")
+    if score_v > score_h:
+        orientation = "vertical"
+        position = int(round(pos_v / width * 100))
+        score = score_v
+    else:
+        orientation = "horizontal"
+        position = int(round(pos_h / height * 100))
+        score = score_h
+
+    position = max(0, min(100, position))
+    return {"score": int(score), "orientation": orientation, "position": position, "tracks": len(bounds)}
 
 
 def draw_detected_boxes(frame, boxes):
@@ -44,20 +179,18 @@ def draw_detected_boxes(frame, boxes):
     return annotated
 
 
-def update_crossing_counts(track_sides, boxes, orientation, line_value, current_ts, margin):
+def update_crossing_counts(track_sides, track_last_seen, frame_index, track_ids, boxes_xyxy, orientation, line_value, time_s, margin, ttl=30):
     events = []
     new_in = 0
     new_out = 0
 
-    if boxes.id is None or boxes.xyxy is None:
+    if not track_ids or not boxes_xyxy:
         return new_in, new_out, events
-
-    track_ids = boxes.id.int().cpu().tolist()
-    boxes_xyxy = boxes.xyxy.cpu().tolist()
     active_ids = set()
 
     for track_id, xyxy in zip(track_ids, boxes_xyxy):
         active_ids.add(track_id)
+        track_last_seen[track_id] = frame_index
         center_x = (xyxy[0] + xyxy[2]) / 2
         center_y = (xyxy[1] + xyxy[3]) / 2
 
@@ -82,22 +215,23 @@ def update_crossing_counts(track_sides, boxes, orientation, line_value, current_
 
         if previous_side == "above" and current_side == "below":
             new_in += 1
-            events.append({"timestamp": current_ts, "direction": "in", "count_delta": 1})
+            events.append({"time_s": time_s, "direction": "in", "count_delta": 1})
         elif previous_side == "below" and current_side == "above":
             new_out += 1
-            events.append({"timestamp": current_ts, "direction": "out", "count_delta": 1})
+            events.append({"time_s": time_s, "direction": "out", "count_delta": 1})
         elif previous_side == "left" and current_side == "right":
             new_in += 1
-            events.append({"timestamp": current_ts, "direction": "in", "count_delta": 1})
+            events.append({"time_s": time_s, "direction": "in", "count_delta": 1})
         elif previous_side == "right" and current_side == "left":
             new_out += 1
-            events.append({"timestamp": current_ts, "direction": "out", "count_delta": 1})
+            events.append({"time_s": time_s, "direction": "out", "count_delta": 1})
 
         track_sides[track_id] = current_side
 
-    stale_ids = [track_id for track_id in track_sides if track_id not in active_ids]
-    for track_id in stale_ids:
-        del track_sides[track_id]
+    expired = [track_id for track_id, last_seen in list(track_last_seen.items()) if frame_index - last_seen > ttl]
+    for track_id in expired:
+        track_last_seen.pop(track_id, None)
+        track_sides.pop(track_id, None)
 
     return new_in, new_out, events
 
@@ -110,7 +244,8 @@ def process_video(video_path, line_pos, orientation, model_name):
     处理视频的完整流程
     """
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    model = YOLO(model_name.replace(" (轻量快速)", "").replace(" (均衡)", "").replace(" (精确)", ""))
+    model = YOLO(model_name)
+    tracker = sv.ByteTrack()
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError("无法打开视频文件，请确认上传文件有效。")
@@ -142,39 +277,38 @@ def process_video(video_path, line_pos, orientation, model_name):
 
     if orientation == "horizontal":
         line_value = int(height * line_pos / 100)
-        margin = max(8, height // 50)
+        margin = max(5, height // 100)
     else:
         line_value = int(width * line_pos / 100)
-        margin = max(8, width // 50)
+        margin = max(5, width // 100)
 
     events = []
     count_in = 0
     count_out = 0
     frame_idx = 0
-    base_time = pd.Timestamp.now().floor("s")
     track_sides = {}
+    track_last_seen = {}
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        results = model.track(
-            frame,
-            persist=True,
-            tracker='bytetrack.yaml',
-            classes=[2, 3, 5, 7]
-        )
+        results = model(frame, classes=[2, 3, 5, 7], verbose=False)
+        detections = sv.Detections.from_ultralytics(results[0])
+        detections = tracker.update_with_detections(detections)
 
-        current_ts = base_time + pd.to_timedelta(frame_idx / fps, unit="s")
-        frame_idx += 1
+        time_s = frame_idx / fps
 
         new_in, new_out, new_events = update_crossing_counts(
             track_sides,
-            results[0].boxes,
+            track_last_seen,
+            frame_idx,
+            detections.tracker_id.tolist() if detections.tracker_id is not None else [],
+            detections.xyxy.tolist() if detections.xyxy is not None else [],
             orientation,
             line_value,
-            current_ts,
+            time_s,
             margin,
         )
         count_in += new_in
@@ -209,13 +343,14 @@ def process_video(video_path, line_pos, orientation, model_name):
             1, (0, 255, 0), 2
         )
         out.write(annotated)
+        frame_idx += 1
 
     cap.release()
     out.release()
 
     events_df = pd.DataFrame(events)
     if events_df.empty:
-        events_df = pd.DataFrame(columns=["timestamp", "direction", "count_delta"])
+        events_df = pd.DataFrame(columns=["time_s", "direction", "count_delta"])
     events_df.to_csv(EVENTS_PATH, index=False)
     generate_charts(events_df)
     return {"in_count": count_in, "out_count": count_out, "event_count": len(events_df)}
@@ -231,19 +366,31 @@ def generate_charts(events_df=None):
         return
 
     df = events_df.copy()
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df['minute'] = df['timestamp'].dt.floor('1min')
-    stats = df.groupby('minute').size().reset_index(name='count')
+    if "time_s" in df.columns and pd.api.types.is_numeric_dtype(df["time_s"]):
+        df["minute"] = (df["time_s"] // 60).astype(int)
+        stats = df.groupby("minute").size().reset_index(name="count")
+        stats["minute_label"] = stats["minute"].apply(lambda m: f"{m:02d}:00")
+    else:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        if df.empty:
+            return
+        df['minute'] = df['timestamp'].dt.floor('1min')
+        stats = df.groupby('minute').size().reset_index(name='count')
 
     plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(stats['minute'], stats['count'], marker='o')
+    if "minute_label" in stats.columns:
+        ax.plot(stats["minute"], stats["count"], marker="o")
+        ax.set_xticks(stats["minute"].tolist())
+        ax.set_xticklabels(stats["minute_label"].tolist(), rotation=45)
+    else:
+        ax.plot(stats['minute'], stats['count'], marker='o')
     ax.set_title('车流量趋势')
     ax.set_xlabel('时间')
     ax.set_ylabel('车辆数')
-    plt.xticks(rotation=45)
     plt.tight_layout()
     plt.savefig(CHART_PATH)
     plt.close()
@@ -255,18 +402,43 @@ uploaded_file = st.sidebar.file_uploader("上传视频文件", type=['mp4', 'avi
 line_orientation = st.sidebar.radio(
     "计数线方向",
     ["水平线（上下穿越）", "垂直线（左右穿越）"],
-    index=0
+    index=0,
+    key="line_orientation",
 )
 
 line_position_label = "计数线位置（画面高度%）" if line_orientation.startswith("水平") else "计数线位置（画面宽度%）"
-line_position = st.sidebar.slider(line_position_label, 0, 100, 60)
-show_preview = st.sidebar.checkbox("显示计数线预览", value=True)
+line_position = st.sidebar.slider(line_position_label, 0, 100, 60, key="line_position")
+show_preview = st.sidebar.checkbox("显示计数线预览", value=True, key="show_preview")
+auto_use_recommended = st.sidebar.checkbox("开始分析前自动推荐并使用计数线", value=True, key="auto_use_recommended")
 
-# 模型选择
-model_option = st.sidebar.selectbox(
-    "选择模型",
-    ["yolov8n.pt (轻量快速)", "yolov8s.pt (均衡)", "yolov8m.pt (精确)"]
+available_models = []
+model_desc = {}
+missing_models = []
+for name, desc in MODEL_CANDIDATES:
+    path = find_local_model(name)
+    model_desc[name] = desc
+    if path:
+        available_models.append(path)
+    else:
+        missing_models.append(name)
+
+if not available_models:
+    st.sidebar.error("未找到本地模型权重文件（例如 yolov8n.pt）。请将 .pt 放到项目根目录后重试。")
+    st.stop()
+
+def model_label(path: str) -> str:
+    base = os.path.basename(path)
+    return f"{base}（{model_desc.get(base, '模型')}，本地）"
+
+model_path = st.sidebar.selectbox(
+    "选择模型（离线仅显示本地可用）",
+    options=available_models,
+    format_func=model_label,
+    key="model_path",
 )
+
+if missing_models:
+    st.sidebar.info("未检测到：" + "、".join(missing_models) + "（离线环境下不会自动下载）")
 
 # 主界面
 if uploaded_file is not None:
@@ -296,10 +468,32 @@ if uploaded_file is not None:
             preview_frame = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
             st.image(preview_frame, caption="计数线预览（黄色）", use_container_width=True)
 
+    recommend_clicked = st.button("自动推荐计数线（基于前200帧）")
+    if recommend_clicked:
+        with st.spinner("正在分析视频轨迹并推荐计数线..."):
+            rec = recommend_counting_line(tfile.name, model_path, max_frames=200)
+        if not rec:
+            st.warning("无法从当前视频中提取稳定轨迹，建议手动调整计数线。")
+        else:
+            st.info(f"推荐：{('水平线' if rec['orientation']=='horizontal' else '垂直线')}，位置 {rec['position']}%，候选轨迹 {rec['tracks']}，覆盖 {rec['score']} 条轨迹")
+            st.session_state["line_orientation"] = "水平线（上下穿越）" if rec["orientation"] == "horizontal" else "垂直线（左右穿越）"
+            st.session_state["line_position"] = int(rec["position"])
+            st.rerun()
+
     if st.button("开始分析", type="primary"):
         try:
             with st.spinner("正在处理视频..."):
-                stats = process_video(tfile.name, line_position, orientation, model_option)
+                used_orientation = orientation
+                used_position = line_position
+                if auto_use_recommended:
+                    rec = recommend_counting_line(tfile.name, model_path, max_frames=200)
+                    if rec and rec["score"] > 0:
+                        used_orientation = rec["orientation"]
+                        used_position = int(rec["position"])
+                        st.info(f"本次使用推荐计数线：{('水平线' if used_orientation=='horizontal' else '垂直线')} {used_position}%（覆盖 {rec['score']} 条轨迹）")
+                    else:
+                        st.info("未能自动推荐计数线，本次使用当前滑块设置。")
+                stats = process_video(tfile.name, used_position, used_orientation, model_path)
         except Exception as exc:
             st.error(f"处理失败：{exc}")
         else:
