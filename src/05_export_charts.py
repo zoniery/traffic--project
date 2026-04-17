@@ -18,9 +18,8 @@ output_dir.mkdir(parents=True, exist_ok=True)
 def configure_matplotlib():
     warnings.filterwarnings(
         "ignore",
-        message=r"Glyph .* missing from font\\(s\\).*",
+        message=r"Glyph .* missing from font\(s\).*",
         category=UserWarning,
-        module=r"matplotlib.*",
     )
     available = {f.name for f in font_manager.fontManager.ttflist}
     preferred = [
