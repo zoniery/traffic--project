@@ -2,9 +2,12 @@ import os
 import tempfile
 
 os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+os.environ.setdefault("MPLBACKEND", "Agg")
 
 import warnings
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
@@ -141,6 +144,7 @@ for bar in bars:
 
 plt.tight_layout()
 plt.savefig(output_dir / 'status_distribution.png', dpi=300, bbox_inches='tight')
+plt.close()
 
 print("图表已生成：")
 print("- traffic_trend.png: 流量趋势图")
