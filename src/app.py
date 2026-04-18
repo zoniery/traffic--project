@@ -33,6 +33,8 @@ OUTPUT_DIR = "data/outputs"
 EVENTS_PATH = os.path.join(OUTPUT_DIR, "events.csv")
 VIDEO_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "processed_video.mp4")
 CHART_PATH = os.path.join(OUTPUT_DIR, "traffic_trend.png")
+REALTIME_TABLE_PATH = os.path.join(OUTPUT_DIR, "realtime_flow_1s.csv")
+REALTIME_CHART_PATH = os.path.join(OUTPUT_DIR, "realtime_flow_1s.png")
 
 MODEL_CANDIDATES = [
     ("yolov8n.pt", "轻量快速"),
@@ -268,45 +270,89 @@ def process_video(video_path, line_pos, orientation, model_name, ttl=90, cooldow
     if events_df.empty:
         events_df = pd.DataFrame(columns=["time_s", "direction", "count_delta"])
     events_df.to_csv(EVENTS_PATH, index=False)
-    generate_charts(events_df)
+    generate_realtime_table(events_df)
+    generate_realtime_chart()
     return {"in_count": count_in, "out_count": count_out, "event_count": len(events_df), "unique_vehicles": len(unique_ids)}
 
-def generate_charts(events_df=None):
-    """生成统计图表"""
+def generate_realtime_table(events_df=None):
     if events_df is None:
         if not os.path.exists(EVENTS_PATH):
             return
         events_df = pd.read_csv(EVENTS_PATH)
 
+    cols = ["second", "in_count", "out_count", "total_count", "cum_in", "cum_out", "cum_total"]
     if events_df.empty:
+        pd.DataFrame(columns=cols).to_csv(REALTIME_TABLE_PATH, index=False)
         return
 
     df = events_df.copy()
-    if "time_s" in df.columns and pd.api.types.is_numeric_dtype(df["time_s"]):
-        df["minute"] = (df["time_s"] // 60).astype(int)
-        stats = df.groupby("minute").size().reset_index(name="count")
-        stats["minute_label"] = stats["minute"].apply(lambda m: f"{m:02d}:00")
-    else:
-        df['timestamp'] = pd.to_datetime(df['timestamp'], errors="coerce")
-        df = df.dropna(subset=["timestamp"])
-        if df.empty:
-            return
-        df['minute'] = df['timestamp'].dt.floor('1min')
-        stats = df.groupby('minute').size().reset_index(name='count')
+    if "time_s" not in df.columns:
+        pd.DataFrame(columns=cols).to_csv(REALTIME_TABLE_PATH, index=False)
+        return
+
+    df["time_s"] = pd.to_numeric(df["time_s"], errors="coerce")
+    df = df.dropna(subset=["time_s"])
+    if df.empty:
+        pd.DataFrame(columns=cols).to_csv(REALTIME_TABLE_PATH, index=False)
+        return
+
+    df["second"] = df["time_s"].astype(float).apply(lambda v: int(v // 1))
+    df["direction"] = df["direction"].astype(str).str.lower()
+    df["count_delta"] = pd.to_numeric(df.get("count_delta", 1), errors="coerce").fillna(1).astype(int)
+
+    grouped = df.groupby(["second", "direction"])["count_delta"].sum().unstack(fill_value=0)
+    in_series = grouped["in"] if "in" in grouped.columns else 0
+    out_series = grouped["out"] if "out" in grouped.columns else 0
+
+    max_second = int(df["second"].max())
+    index = pd.Index(range(0, max_second + 1), name="second")
+    in_series = pd.Series(in_series, index=index).fillna(0).astype(int)
+    out_series = pd.Series(out_series, index=index).fillna(0).astype(int)
+
+    table = pd.DataFrame({"second": index})
+    table["in_count"] = in_series.values
+    table["out_count"] = out_series.values
+    table["total_count"] = table["in_count"] + table["out_count"]
+    table["cum_in"] = table["in_count"].cumsum()
+    table["cum_out"] = table["out_count"].cumsum()
+    table["cum_total"] = table["total_count"].cumsum()
+    table.to_csv(REALTIME_TABLE_PATH, index=False)
+
+def generate_realtime_chart():
+    if not os.path.exists(REALTIME_TABLE_PATH):
+        return
+    df = pd.read_csv(REALTIME_TABLE_PATH)
+    if df.empty or "second" not in df.columns:
+        return
+
+    for col in ("second", "in_count", "out_count", "total_count"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["second"])
+    if df.empty:
+        return
 
     try:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        if "minute_label" in stats.columns:
-            ax.plot(stats["minute"], stats["count"], marker="o")
-            ax.set_xticks(stats["minute"].tolist())
-            ax.set_xticklabels(stats["minute_label"].tolist(), rotation=45)
-        else:
-            ax.plot(stats['minute'], stats['count'], marker='o')
-        ax.set_title('车流量趋势')
-        ax.set_xlabel('时间')
-        ax.set_ylabel('车辆数')
+        fig, ax = plt.subplots(figsize=(12, 5))
+        x = df["second"].astype(int).tolist()
+        y_total = df["total_count"].fillna(0).astype(int).tolist() if "total_count" in df.columns else []
+        y_in = df["in_count"].fillna(0).astype(int).tolist() if "in_count" in df.columns else []
+        y_out = df["out_count"].fillna(0).astype(int).tolist() if "out_count" in df.columns else []
+
+        if y_total:
+            ax.plot(x, y_total, linewidth=2, color="#2E86AB", label="total/s")
+        if y_in:
+            ax.plot(x, y_in, linewidth=1.5, color="#2ECC71", alpha=0.9, label="in/s")
+        if y_out:
+            ax.plot(x, y_out, linewidth=1.5, color="#E74C3C", alpha=0.9, label="out/s")
+
+        ax.set_title("每秒实时车流量", fontsize=14, fontweight="bold")
+        ax.set_xlabel("秒 (s)", fontsize=12)
+        ax.set_ylabel("车辆数 (辆/秒)", fontsize=12)
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="upper right")
         plt.tight_layout()
-        plt.savefig(CHART_PATH)
+        plt.savefig(REALTIME_CHART_PATH, dpi=220, bbox_inches="tight")
     except Exception:
         return
     finally:

@@ -11,6 +11,8 @@ try:
         EVENTS_PATH,
         MODEL_CANDIDATES,
         MIN_RECOMMEND_SCORE,
+        REALTIME_CHART_PATH,
+        REALTIME_TABLE_PATH,
         VIDEO_OUTPUT_PATH,
         find_local_model,
         process_video,
@@ -22,6 +24,8 @@ except Exception:
         EVENTS_PATH,
         MODEL_CANDIDATES,
         MIN_RECOMMEND_SCORE,
+        REALTIME_CHART_PATH,
+        REALTIME_TABLE_PATH,
         VIDEO_OUTPUT_PATH,
         find_local_model,
         process_video,
@@ -421,10 +425,13 @@ div.stButton > button[data-testid="baseButton-primary"]:hover {
 
             tabs = st.tabs(["概览", "事件数据", "处理后视频", "下载"])
             with tabs[0]:
-                if os.path.exists(CHART_PATH):
-                    st.image(CHART_PATH, use_container_width=True)
+                if os.path.exists(REALTIME_CHART_PATH):
+                    st.image(REALTIME_CHART_PATH, use_container_width=True)
+                if os.path.exists(REALTIME_TABLE_PATH):
+                    flow_df = pd.read_csv(REALTIME_TABLE_PATH)
+                    st.dataframe(flow_df, use_container_width=True, height=360)
                 else:
-                    callout("info", "暂无趋势图", ["当出现过线事件后会自动生成分钟级趋势图。"])
+                    callout("info", "暂无实时流量表", ["当出现过线事件后会自动生成每秒流量表。"])
 
             with tabs[1]:
                 st.dataframe(events_df, use_container_width=True, height=420)
@@ -459,17 +466,28 @@ div.stButton > button[data-testid="baseButton-primary"]:hover {
                         )
                 else:
                     st.markdown("<div class='small-muted'>事件日志：暂无可下载文件。</div>", unsafe_allow_html=True)
-                if os.path.exists(CHART_PATH):
-                    with open(CHART_PATH, "rb") as f:
+                if os.path.exists(REALTIME_TABLE_PATH):
+                    with open(REALTIME_TABLE_PATH, "rb") as f:
                         st.download_button(
-                            label="下载趋势图表",
+                            label="下载实时流量表(CSV)",
                             data=f,
-                            file_name="traffic_trend.png",
+                            file_name="realtime_flow_1s.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                        )
+                else:
+                    st.markdown("<div class='small-muted'>实时流量表：暂无可下载文件。</div>", unsafe_allow_html=True)
+                if os.path.exists(REALTIME_CHART_PATH):
+                    with open(REALTIME_CHART_PATH, "rb") as f:
+                        st.download_button(
+                            label="下载实时折线图(PNG)",
+                            data=f,
+                            file_name="realtime_flow_1s.png",
                             mime="image/png",
                             use_container_width=True,
                         )
                 else:
-                    st.markdown("<div class='small-muted'>趋势图表：暂无可下载文件。</div>", unsafe_allow_html=True)
+                    st.markdown("<div class='small-muted'>实时折线图：暂无可下载文件。</div>", unsafe_allow_html=True)
                 card_close()
         finally:
             st.session_state["is_processing"] = False
